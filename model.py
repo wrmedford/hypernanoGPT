@@ -5,15 +5,54 @@ References:
 https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+
+Enhanced with ETHOS MoE support for efficient sparse models.
 """
 
 import math
 import inspect
 from dataclasses import dataclass
+import sys
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# Import ETHOS components if available
+try:
+    sys.path.append('./variations/ethos')
+    from ethos.model import SimplifiedHypernetMoE
+    from ethos.kernels import FusedLowRankMoE_Reordered
+    ETHOS_AVAILABLE = True
+except ImportError:
+    print("Warning: ETHOS not found in ./variations/ethos/. MoE features will be disabled.")
+    ETHOS_AVAILABLE = False
+
+
+# ============================================================================
+# ETHOS Configuration Helper
+# ============================================================================
+
+@dataclass
+class ETHOSConfig:
+    """Configuration object compatible with ETHOS modules"""
+    d_model: int
+    num_experts: int
+    top_k: int
+    num_routing_heads: int
+    d_latent: int
+    d_intermediate_hypernet: int
+    d_query: int
+    d_ffn_intermediate: int
+    use_triton: bool = True
+    rms_norm_eps: float = 1e-6
+    max_seq_len: int = 1024
+    rope_theta: float = 10000.0
+
+
+# ============================================================================
+# Model Components
+# ============================================================================
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -25,6 +64,7 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -75,6 +115,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -91,22 +132,63 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        
+        # Decide whether to use MoE or standard FFN
+        use_moe = (ETHOS_AVAILABLE and 
+                  hasattr(config, 'use_moe') and 
+                  config.use_moe and 
+                  layer_idx is not None and
+                  layer_idx >= getattr(config, 'num_dense_layers', 0))
+        
+        if use_moe:
+            # Create ETHOS config
+            ethos_config = ETHOSConfig(
+                d_model=config.n_embd,
+                num_experts=config.num_experts,
+                top_k=config.top_k,
+                num_routing_heads=config.num_routing_heads,
+                d_latent=config.d_latent,
+                d_intermediate_hypernet=config.d_intermediate_hypernet,
+                d_query=config.d_query,
+                d_ffn_intermediate=4 * config.n_embd,
+                use_triton=getattr(config, 'use_triton', True),
+                max_seq_len=config.block_size,
+            )
+            
+            # Try to use optimized kernel, fall back to PyTorch implementation
+            if ethos_config.use_triton:
+                try:
+                    self.mlp = FusedLowRankMoE_Reordered(ethos_config)
+                    if layer_idx == getattr(config, 'num_dense_layers', 0):  # First MoE layer
+                        print(f"✓ Using ETHOS FusedLowRankMoE (Triton) starting at layer {layer_idx}")
+                except Exception as e:
+                    self.mlp = SimplifiedHypernetMoE(ethos_config)
+                    if layer_idx == getattr(config, 'num_dense_layers', 0):
+                        print(f"✓ Using ETHOS SimplifiedHypernetMoE (PyTorch) starting at layer {layer_idx}")
+            else:
+                self.mlp = SimplifiedHypernetMoE(ethos_config)
+                if layer_idx == getattr(config, 'num_dense_layers', 0):
+                    print(f"✓ Using ETHOS SimplifiedHypernetMoE (PyTorch) starting at layer {layer_idx}")
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
+
 @dataclass
 class GPTConfig:
+    # Original GPT parameters
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -114,6 +196,18 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    
+    # ETHOS MoE parameters (optional)
+    use_moe: bool = False
+    num_dense_layers: int = 0  # Number of initial layers to keep dense
+    num_experts: int = 512**2  # Must be a perfect square for product key routing
+    d_latent: int = 128
+    d_intermediate_hypernet: int = 512
+    top_k: int = 16
+    num_routing_heads: int = 8
+    d_query: int = 512
+    use_triton: bool = True
+
 
 class GPT(nn.Module):
 
@@ -127,7 +221,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -146,6 +240,14 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        
+        # Report active parameters if using MoE
+        if hasattr(config, 'use_moe') and config.use_moe and ETHOS_AVAILABLE:
+            active_params = self._estimate_active_params()
+            print("active parameters: %.2fM (%.1f%% sparse)" % (
+                active_params/1e6, 
+                (1 - active_params/self.get_num_params())*100
+            ))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -166,6 +268,32 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _estimate_active_params(self):
+        """Estimate active parameters when using MoE"""
+        config = self.config
+        
+        # Embedding + position embeddings + final LN + LM head
+        active = config.vocab_size * config.n_embd * 2 + config.n_embd
+        
+        # Per layer
+        for i in range(config.n_layer):
+            # Attention is always fully active
+            active += config.n_embd * 4 * config.n_embd  # QKV + proj
+            active += config.n_embd * 2  # LayerNorms
+            
+            # FFN/MoE
+            if i >= config.num_dense_layers and config.use_moe:
+                # MoE active params: routing + selected experts
+                active += config.num_routing_heads * (
+                    config.n_embd * config.d_query +  # Routing projections
+                    config.top_k * 2 * config.n_embd   # Active expert params
+                )
+            else:
+                # Dense FFN
+                active += 8 * config.n_embd * config.n_embd
+        
+        return active
 
     def forward(self, idx, targets=None):
         device = idx.device
